@@ -24,6 +24,29 @@ except Exception as e:
 
 app = FastAPI()
 
+# --- 1.1 ФЕЙКОВАЯ БАЗА КВЕСТОВ (Для меню в Хабе) ---
+# В будущем мы будем брать это из MongoDB, но пока хардкод для теста GUI
+ACTIVE_QUESTS = [
+    {
+        "id": 1,
+        "name": "Cowboy Adventure",
+        "placeId": 75192668653115, # Твой ID игры с ковбоями
+        "description": "Проведи 60 секунд на Диком Западе!",
+        "reward": 100,
+        "time_required": 60,
+        "image_id": "rbxassetid://0" # Сюда потом можно вставить ID картинки
+    },
+    {
+        "id": 2,
+        "name": "Test Quest 2", 
+        "placeId": 75192668653115, # Пока ведет туда же для теста
+        "description": "Просто тест второго слота в меню",
+        "reward": 50,
+        "time_required": 30,
+        "image_id": "rbxassetid://0"
+    }
+]
+
 # --- 2. МОДЕЛИ ДАННЫХ ---
 class GameRegistration(BaseModel):
     ownerId: int        
@@ -42,6 +65,12 @@ class TokenVerification(BaseModel):
 @app.get("/")
 def home():
     return {"status": "Online"}
+
+# 👇 НОВЫЙ ЭНДПОИНТ: Получение списка квестов для Хаба 👇
+@app.get("/get-quests")
+def get_quests():
+    # Отдаем список активных заданий
+    return {"success": True, "quests": ACTIVE_QUESTS}
 
 @app.post("/register-game")
 def register_game(data: GameRegistration):
@@ -91,8 +120,6 @@ def verify_token(data: TokenVerification):
         return {"success": False, "message": "Токен не найден"}
     
     if quest["status"] != "started":
-        # Если игрок перезашел, но уже был отмечен как arrived, можно вернуть success,
-        # чтобы таймер продолжился, но для простоты пока оставим ошибку.
         return {"success": False, "message": "Токен уже использован или истек"}
         
     quests.update_one(
@@ -106,7 +133,7 @@ def verify_token(data: TokenVerification):
     print(f"✅ Игрок {quest['player_id']} прибыл! Таймер запущен.")
     return {"success": True, "player_id": quest["player_id"]}
 
-# 👇 ЭТАП 2: ПРОВЕРКА ТАЙМЕРА (НОВОЕ) 👇
+# 👇 ЭТАП 2: ПРОВЕРКА ТАЙМЕРА 👇
 @app.post("/check-timer")
 def check_timer(data: TokenVerification):
     quests = db["quests"]
@@ -116,14 +143,12 @@ def check_timer(data: TokenVerification):
     if not quest:
         return {"success": False, "message": "Токен не найден"}
     
-    # Игрок должен был сначала дернуть verify-token
     if quest.get("status") != "arrived":
         return {"success": False, "message": "Сначала подтвердите прибытие (verify-token)"}
 
     # Математика времени
     arrived_at = quest.get("arrived_at")
     
-    # Защита от глюков формата даты
     if isinstance(arrived_at, str):
         arrived_at = datetime.datetime.fromisoformat(arrived_at)
         
@@ -133,13 +158,11 @@ def check_timer(data: TokenVerification):
     REQUIRED_TIME = 60 # Время в секундах
     
     if seconds_passed >= REQUIRED_TIME:
-        # ✅ КВЕСТ ВЫПОЛНЕН
         quests.update_one(
             {"_id": quest["_id"]}, 
             {"$set": {"status": "completed", "completed_at": now}}
         )
         return {"success": True, "message": "Квест выполнен!", "reward": 100}
     else:
-        # ⏳ ЕЩЕ РАНО
         remaining = int(REQUIRED_TIME - seconds_passed)
         return {"success": False, "message": f"Жди еще {remaining} сек."}
