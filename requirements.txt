@@ -3,3 +3,6 @@ uvicorn
 requests
 pymongo
 dnspython
+python-dotenv
+certifi
+pydantic
