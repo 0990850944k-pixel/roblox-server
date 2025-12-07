@@ -80,21 +80,21 @@ def start_quest(data: QuestStart):
     print(f"🚀 Выдан токен: {token} для игрока {data.player_id}")
     return {"success": True, "token": token}
 
-# 👇 НОВЫЙ ЭНДПОИНТ: ПРОВЕРКА НА ВХОДЕ 👇
+# 👇 ЭТАП 1: ИГРОК ПРИБЫЛ 👇
 @app.post("/verify-token")
 def verify_token(data: TokenVerification):
     quests = db["quests"]
     
-    # 1. Ищем такой токен в базе
     quest = quests.find_one({"token": data.token})
     
     if not quest:
         return {"success": False, "message": "Токен не найден"}
     
     if quest["status"] != "started":
+        # Если игрок перезашел, но уже был отмечен как arrived, можно вернуть success,
+        # чтобы таймер продолжился, но для простоты пока оставим ошибку.
         return {"success": False, "message": "Токен уже использован или истек"}
         
-    # 2. Если все ок — помечаем, что игрок ПРИБЫЛ
     quests.update_one(
         {"_id": quest["_id"]}, 
         {"$set": {
@@ -103,5 +103,43 @@ def verify_token(data: TokenVerification):
         }}
     )
     
-    print(f"✅ Игрок {quest['player_id']} успешно прибыл! Начинаем отсчет.")
+    print(f"✅ Игрок {quest['player_id']} прибыл! Таймер запущен.")
     return {"success": True, "player_id": quest["player_id"]}
+
+# 👇 ЭТАП 2: ПРОВЕРКА ТАЙМЕРА (НОВОЕ) 👇
+@app.post("/check-timer")
+def check_timer(data: TokenVerification):
+    quests = db["quests"]
+    
+    quest = quests.find_one({"token": data.token})
+    
+    if not quest:
+        return {"success": False, "message": "Токен не найден"}
+    
+    # Игрок должен был сначала дернуть verify-token
+    if quest.get("status") != "arrived":
+        return {"success": False, "message": "Сначала подтвердите прибытие (verify-token)"}
+
+    # Математика времени
+    arrived_at = quest.get("arrived_at")
+    
+    # Защита от глюков формата даты
+    if isinstance(arrived_at, str):
+        arrived_at = datetime.datetime.fromisoformat(arrived_at)
+        
+    now = datetime.datetime.utcnow()
+    seconds_passed = (now - arrived_at).total_seconds()
+    
+    REQUIRED_TIME = 60 # Время в секундах
+    
+    if seconds_passed >= REQUIRED_TIME:
+        # ✅ КВЕСТ ВЫПОЛНЕН
+        quests.update_one(
+            {"_id": quest["_id"]}, 
+            {"$set": {"status": "completed", "completed_at": now}}
+        )
+        return {"success": True, "message": "Квест выполнен!", "reward": 100}
+    else:
+        # ⏳ ЕЩЕ РАНО
+        remaining = int(REQUIRED_TIME - seconds_passed)
+        return {"success": False, "message": f"Жди еще {remaining} сек."}
