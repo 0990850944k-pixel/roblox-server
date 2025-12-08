@@ -25,60 +25,52 @@ except Exception as e:
 app = FastAPI()
 
 # --- 2. МОДЕЛИ ДАННЫХ ---
-# 👇 ОБНОВИЛИ МОДЕЛЬ: ТЕПЕРЬ МЫ СОХРАНЯЕМ ДЕТАЛИ ИГРЫ
 class GameRegistration(BaseModel):
     ownerId: int        
     placeId: int
-    name: str           # Название квеста
-    description: str    # Описание
-    reward: int         # Сколько золота платит владелец
-    time_required: int  # Сколько секунд надо сидеть
+    name: str
+    description: str
+    reward: int
+    time_required: int
 
 class QuestStart(BaseModel):
     api_key: str            
     player_id: int          
-    destination_place_id: int 
+    destination_place_id: int
+    source_place_id: int    # 👈 НОВОЕ: Откуда пришел игрок
 
 class TokenVerification(BaseModel):
     token: str
+
+class RewardClaim(BaseModel):
+    player_id: int
+    current_place_id: int   # 👈 НОВОЕ: Где сейчас игрок (чтобы выдать награду в правильной игре)
 
 # --- 3. ЭНДПОИНТЫ ---
 
 @app.get("/")
 def home():
-    return {"status": "Online"}
+    return {"status": "Offer Wall Online"}
 
-# 👇 ОБНОВЛЕНО: ТЕПЕРЬ БЕРЕМ ИЗ БАЗЫ, А НЕ ИЗ СПИСКА
 @app.get("/get-quests")
 def get_quests():
     games_collection = db["games"]
-    # Берем все игры, которые "active" (можно добавить фильтрацию)
-    # _id: 0 означает "не показывать технический ID базы", чтобы не мусорить
-    quests = list(games_collection.find({}, {"_id": 0}))
+    quests = list(games_collection.find({"status": "active"}, {"_id": 0}))
     return {"success": True, "quests": quests}
 
-# 👇 ОБНОВЛЕНО: РЕГИСТРАЦИЯ ПОЛНОЦЕННОЙ ИГРЫ
 @app.post("/register-game")
 def register_game(data: GameRegistration):
     users_collection = db["users"]
     games_collection = db["games"]
     
-    # 1. Проверяем/Создаем пользователя (Владельца)
+    # Регистрация владельца (если нет)
     existing_user = users_collection.find_one({"_id": data.ownerId})
-    api_key = ""
+    api_key = existing_user["api_key"] if existing_user else "SK_" + str(uuid.uuid4()).replace("-", "").upper()
     
-    if existing_user:
-        api_key = existing_user["api_key"]
-    else:
-        api_key = "SK_" + str(uuid.uuid4()).replace("-", "").upper()
-        users_collection.insert_one({
-            "_id": data.ownerId, 
-            "api_key": api_key, 
-            "balance": 0 
-        })
+    if not existing_user:
+        users_collection.insert_one({"_id": data.ownerId, "api_key": api_key, "balance": 0})
 
-    # 2. Сохраняем саму игру в коллекцию "games"
-    # Если игра с таким ID уже есть — обновляем её данные
+    # Сохраняем игру (Рекламное объявление)
     games_collection.update_one(
         {"placeId": data.placeId},
         {"$set": {
@@ -89,34 +81,29 @@ def register_game(data: GameRegistration):
             "time_required": data.time_required,
             "status": "active"
         }},
-        upsert=True # Если нет - создать, если есть - обновить
+        upsert=True
     )
-    
-    print(f"✅ Игра {data.name} (ID: {data.placeId}) зарегистрирована!")
     return {"success": True, "api_key": api_key}
 
+# 👇 СТАРТ: ЗАПОМИНАЕМ, ОТКУДА ПРИШЕЛ ИГРОК
 @app.post("/start-quest")
 def start_quest(data: QuestStart):
-    users = db["users"]
     quests = db["quests"]
     
-    # Ищем владельца по API Key
-    user = users.find_one({"api_key": data.api_key})
-    if not user:
-        raise HTTPException(status_code=401, detail="Неверный API Key")
+    # Тут можно добавить проверку API Key, если SDK интегрирован везде
     
     token = str(uuid.uuid4())
     
     quests.insert_one({
         "token": token,
         "player_id": data.player_id,
-        "from_owner": user["_id"],
-        "target_game": data.destination_place_id,
+        "source_game": data.source_place_id,      # 👈 Запоминаем "Игру А"
+        "target_game": data.destination_place_id, # 👈 Запоминаем "Игру Б"
         "status": "started",
         "timestamp": datetime.datetime.utcnow()
     })
     
-    print(f"🚀 Выдан токен: {token} для игрока {data.player_id}")
+    print(f"🚀 Игрок {data.player_id} начал квест из игры {data.source_place_id} в {data.destination_place_id}")
     return {"success": True, "token": token}
 
 @app.post("/verify-token")
@@ -124,39 +111,67 @@ def verify_token(data: TokenVerification):
     quests = db["quests"]
     quest = quests.find_one({"token": data.token})
     
-    if not quest:
-        return {"success": False, "message": "Токен не найден"}
-    
-    if quest["status"] != "started":
-        return {"success": False, "message": "Токен уже использован"}
+    if not quest: return {"success": False, "message": "Token not found"}
+    if quest["status"] != "started": return {"success": False, "message": "Used token"}
         
     quests.update_one(
         {"_id": quest["_id"]}, 
         {"$set": {"status": "arrived", "arrived_at": datetime.datetime.utcnow()}}
     )
-    return {"success": True, "player_id": quest["player_id"]}
+    # Возвращаем ID исходной игры, чтобы знать, куда возвращать игрока
+    return {"success": True, "player_id": quest["player_id"], "return_to": quest["source_game"]}
 
 @app.post("/check-timer")
 def check_timer(data: TokenVerification):
     quests = db["quests"]
+    games = db["games"]
+    
     quest = quests.find_one({"token": data.token})
-    
-    if not quest: return {"success": False, "message": "Токен не найден"}
-    if quest.get("status") != "arrived": return {"success": False, "message": "Не подтверждено"}
+    if not quest or quest.get("status") != "arrived":
+        return {"success": False, "message": "Not arrived"}
 
-    arrived_at = quest.get("arrived_at")
-    if isinstance(arrived_at, str):
-        arrived_at = datetime.datetime.fromisoformat(arrived_at)
-        
-    # В РЕАЛЬНОСТИ: Тут мы должны брать `time_required` из базы игры, а не хардкод 60
-    # Но для теста пока оставим 60 или вытащим из квеста
-    REQUIRED_TIME = 60 
+    # Проверка времени
+    game_info = games.find_one({"placeId": quest["target_game"]})
+    REQUIRED_TIME = game_info["time_required"] if game_info else 60
     
-    now = datetime.datetime.utcnow()
-    seconds_passed = (now - arrived_at).total_seconds()
+    arrived_at = quest.get("arrived_at")
+    if isinstance(arrived_at, str): arrived_at = datetime.datetime.fromisoformat(arrived_at)
+    
+    seconds_passed = (datetime.datetime.utcnow() - arrived_at).total_seconds()
     
     if seconds_passed >= REQUIRED_TIME:
-        quests.update_one({"_id": quest["_id"]}, {"$set": {"status": "completed"}})
-        return {"success": True, "message": "Квест выполнен!", "reward": 100}
+        quests.update_one({"_id": quest["_id"]}, {"$set": {"status": "completed", "completed_at": datetime.datetime.utcnow()}})
+        return {"success": True, "message": "Квест выполнен! Возвращайся за наградой.", "return_id": quest["source_game"]}
     else:
-        return {"success": False, "message": f"Жди {int(REQUIRED_TIME - seconds_passed)} сек."}
+        return {"success": False, "message": f"Осталось {int(REQUIRED_TIME - seconds_passed)} сек."}
+
+# 👇 ВЫДАЧА НАГРАДЫ (Только если игрок вернулся в Игру А)
+@app.post("/claim-rewards")
+def claim_rewards(data: RewardClaim):
+    quests = db["quests"]
+    games = db["games"]
+    
+    # Ищем квесты, которые выполнены, но не оплачены, И которые были начаты ИМЕННО В ЭТОЙ ИГРЕ
+    pending_quests = list(quests.find({
+        "player_id": data.player_id,
+        "status": "completed",
+        "source_game": data.current_place_id # 👈 Критически важно!
+    }))
+    
+    total_reward = 0
+    ids_to_update = []
+    
+    for q in pending_quests:
+        g = games.find_one({"placeId": q["target_game"]})
+        reward = g["reward"] if g else 0
+        total_reward += reward
+        ids_to_update.append(q["_id"])
+    
+    if ids_to_update:
+        quests.update_many(
+            {"_id": {"$in": ids_to_update}},
+            {"$set": {"status": "claimed", "claimed_at": datetime.datetime.utcnow()}}
+        )
+        return {"success": True, "reward": total_reward}
+    else:
+        return {"success": True, "reward": 0}
