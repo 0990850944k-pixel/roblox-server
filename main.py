@@ -9,7 +9,6 @@ import datetime
 import time 
 
 # 👇 БИБЛИОТЕКА ЗАЩИТЫ ОТ СПАМА (Rate Limiting)
-# Не забудь добавить 'slowapi' в requirements.txt!
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -39,13 +38,22 @@ app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- 🛡 ЗАЩИТА 1: ПРОВЕРКА USER-AGENT (ТОЛЬКО ROBLOX) ---
+# --- ⚙️ НАСТРОЙКИ ЭКОНОМИКИ ---
+TIER_CONFIG = {
+    1: {"cost": 8, "time": 60,  "payout": 6},
+    2: {"cost": 15, "time": 180, "payout": 11},
+    3: {"cost": 30, "time": 300, "payout": 22}
+}
+
+DAILY_LIMIT = 20
+
+# 🔥 НОВЫЕ НАСТРОЙКИ (ТЕСТОВЫЙ БАЛАНС)
+STARTING_TEST_BALANCE = 500  # Сколько даем каждому новичку
+GAME_TEST_CAP = 500          # Максимум тестовых кредитов, которые может ПРИНЯТЬ одна игра
+
+# --- 🛡 ЗАЩИТА 1: ПРОВЕРКА USER-AGENT ---
 async def verify_roblox_request(request: Request):
     user_agent = request.headers.get("user-agent", "")
-    
-    # 1. Если запрос от Роблокса (User-Agent содержит "Roblox/") -> Пропускаем
-    # 2. Если запрос от ТЕБЯ (есть x-admin-secret) -> Пропускаем (для тестов через Postman)
-    
     is_roblox = "Roblox/" in user_agent
     has_admin_secret = request.headers.get("x-admin-secret") == ADMIN_SECRET
     
@@ -57,16 +65,6 @@ async def verify_roblox_request(request: Request):
 async def verify_game_secret(x_game_secret: str = Header(None)):
     if x_game_secret != GAME_SERVER_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Game Secret Key")
-
-# --- КОНФИГУРАЦИЯ ТИРОВ ---
-# Я поправил выплаты, чтобы они росли вместе с ценой (экономика должна быть честной)
-TIER_CONFIG = {
-    1: {"cost": 10, "time": 60,  "payout": 7},
-    2: {"cost": 15, "time": 180, "payout": 11}, # Было 7, стало 11
-    3: {"cost": 25, "time": 300, "payout": 18}  # Было 7, стало 18
-}
-
-DAILY_LIMIT = 20
 
 # --- МОДЕЛИ ---
 class GameRegistration(BaseModel):
@@ -84,26 +82,32 @@ class AddBalance(BaseModel):
 
 # --- ЭНДПОИНТЫ ---
 
-# 1. ДАШБОРД
+# 1. ДАШБОРД (Обновлен: показывает 2 баланса)
 @app.get("/get-dashboard")
-@limiter.limit("60/minute") # Макс 60 раз в минуту с одного IP
+@limiter.limit("60/minute") 
 def get_dashboard(request: Request, ownerId: int, placeId: int):
     users = db["users"]
     games = db["games"]
     user = users.find_one({"_id": int(ownerId)})
     game = games.find_one({"placeId": int(placeId)})
     
+    # Считаем, сколько еще халявы может принять эта игра
+    test_used = game.get("test_credits_used", 0) if game else 0
+    test_cap_remaining = max(0, GAME_TEST_CAP - test_used)
+    
     return {
         "success": True, 
         "balance": user.get("balance", 0) if user else 0, 
+        "test_balance": user.get("test_balance", 0) if user else 0, # 👈 Тестовый баланс
         "remaining_visits": game.get("remaining_visits", 0) if game else 0,
         "status": game.get("status", "inactive") if game else "not_registered",
-        "tier": game.get("tier", 1) if game else 1
+        "tier": game.get("tier", 1) if game else 1,
+        "test_cap_remaining": test_cap_remaining # 👈 Сколько еще можно влить тестов
     }
 
 # 2. ПОЛУЧЕНИЕ КВЕСТОВ
 @app.get("/get-quests")
-@limiter.limit("120/minute") # Лимит повыше, так как игроки часто обновляют список
+@limiter.limit("120/minute")
 def get_quests(request: Request):
     games_collection = db["games"]
     quests_collection = db["quests"]
@@ -128,7 +132,7 @@ def get_quests(request: Request):
             
     return {"success": True, "quests": available_quests}
 
-# 3. РЕГИСТРАЦИЯ ИГРЫ (Макс защита)
+# 3. РЕГИСТРАЦИЯ ИГРЫ (Выдает 500 кредитов всем новым)
 @app.post("/register-game", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 @limiter.limit("10/minute")
 def register_game(request: Request, data: GameRegistration):
@@ -137,9 +141,20 @@ def register_game(request: Request, data: GameRegistration):
     
     tier_data = TIER_CONFIG.get(data.tier, TIER_CONFIG[1])
     
-    if not users_collection.find_one({"_id": data.ownerId}):
-        users_collection.insert_one({"_id": data.ownerId, "balance": 0})
+    # 1. Если пользователя нет - создаем и даем 500 тестовых кредитов
+    user = users_collection.find_one({"_id": data.ownerId})
+    if not user:
+        users_collection.insert_one({
+            "_id": data.ownerId, 
+            "balance": 0, 
+            "test_balance": STARTING_TEST_BALANCE # 🎁 ПОДАРОК ПРИ РЕГИСТРАЦИИ
+        })
+    else:
+        # Если старый юзер без поля test_balance - добавляем поле (чтобы не было ошибок)
+        if "test_balance" not in user:
+             users_collection.update_one({"_id": data.ownerId}, {"$set": {"test_balance": STARTING_TEST_BALANCE}})
 
+    # 2. Регистрируем игру
     games_collection.update_one(
         {"placeId": data.placeId},
         {"$set": {
@@ -154,12 +169,15 @@ def register_game(request: Request, data: GameRegistration):
             "status": "active",
             "last_updated": datetime.datetime.utcnow()
         },
-        "$setOnInsert": {"remaining_visits": 0}}, 
+        "$setOnInsert": {
+            "remaining_visits": 0,
+            "test_credits_used": 0 # 👈 Счетчик использованной халявы для этой игры
+        }}, 
         upsert=True
     )
     return {"success": True, "message": f"Registered Tier {data.tier}"}
 
-# 4. ПОКУПКА ВИЗИТОВ
+# 4. ПОКУПКА ВИЗИТОВ (УМНАЯ ЛОГИКА)
 @app.post("/buy-visits", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 @limiter.limit("20/minute")
 def buy_visits(request: Request, data: BuyVisits):
@@ -175,13 +193,37 @@ def buy_visits(request: Request, data: BuyVisits):
     user = users.find_one({"_id": data.ownerId})
     if not user: return {"success": False, "message": "User not found"}
     
-    if user.get("balance", 0) < total_cost:
-        return {"success": False, "message": f"Need {total_cost} credits"}
+    # Балансы
+    real_bal = user.get("balance", 0)
+    test_bal = user.get("test_balance", 0)
     
-    users.update_one({"_id": data.ownerId}, {"$inc": {"balance": -total_cost}})
-    games.update_one({"placeId": data.placeId}, {"$inc": {"remaining_visits": data.amount}})
+    # Сколько халявы уже использовала эта игра
+    game_test_used = game.get("test_credits_used", 0)
     
-    return {"success": True, "message": f"Bought {data.amount} visits"}
+    # --- ЛОГИКА ОПЛАТЫ ---
+    
+    # 1. Пытаемся оплатить ТЕСТОВЫМИ
+    # Условия: Есть тестовые деньги И Лимит игры (500) не будет превышен
+    if test_bal >= total_cost and (game_test_used + total_cost <= GAME_TEST_CAP):
+        # Списываем тестовые
+        users.update_one({"_id": data.ownerId}, {"$inc": {"test_balance": -total_cost}})
+        # Обновляем игру: добавляем визиты и увеличиваем счетчик использованной халявы
+        games.update_one({"placeId": data.placeId}, {
+            "$inc": {"remaining_visits": data.amount, "test_credits_used": total_cost}
+        })
+        return {"success": True, "message": f"Bought with TEST credits ({data.amount} visits)"}
+
+    # 2. Если тестовые не подходят (или кончились, или лимит игры исчерпан), пробуем РЕАЛЬНЫЕ
+    if real_bal >= total_cost:
+        users.update_one({"_id": data.ownerId}, {"$inc": {"balance": -total_cost}})
+        games.update_one({"placeId": data.placeId}, {"$inc": {"remaining_visits": data.amount}})
+        return {"success": True, "message": f"Bought with REAL credits ({data.amount} visits)"}
+
+    # 3. Если денег нет ни там, ни там
+    if test_bal >= total_cost and (game_test_used + total_cost > GAME_TEST_CAP):
+         return {"success": False, "message": "Game Promo Limit Reached (Max 500 Test Credits)"}
+    
+    return {"success": False, "message": f"Need {total_cost} credits"}
 
 # 5. СТАРТ КВЕСТА
 @app.post("/start-quest", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
