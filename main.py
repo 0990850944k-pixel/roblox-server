@@ -43,12 +43,18 @@ DAILY_LIMIT = 20
 STARTING_TEST_BALANCE = 500
 AUTO_APPROVE_VISITS = 500
 
-# --- ЗАЩИТА ---
+# --- 🛡 ЗАЩИТА (ИСПРАВЛЕНО) ---
 async def verify_roblox_request(request: Request):
     user_agent = request.headers.get("user-agent", "")
     is_roblox = "Roblox/" in user_agent
+    
+    # Проверяем наличие ключей
     has_admin_secret = request.headers.get("x-admin-secret") == ADMIN_SECRET
-    if not is_roblox and not has_admin_secret:
+    has_game_secret = request.headers.get("x-game-secret") == GAME_SERVER_SECRET # 👈 ДОБАВЛЕНО
+    
+    # Пропускаем, если это Роблокс ИЛИ есть правильный админ-ключ ИЛИ есть правильный игровой ключ
+    if not is_roblox and not has_admin_secret and not has_game_secret:
+        print(f"⛔ Blocked Request. UA: {user_agent}")
         raise HTTPException(status_code=403, detail="Roblox Only")
 
 async def verify_game_secret(x_game_secret: str = Header(None)):
