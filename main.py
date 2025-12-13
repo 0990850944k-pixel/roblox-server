@@ -7,17 +7,14 @@ import uuid
 import certifi
 import datetime
 import time 
-import httpx # 👈 ОБЯЗАТЕЛЬНО: Проверка визитов
+import httpx 
 
-# 👇 ЗАЩИТА ОТ СПАМА
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 MONGO_URL = os.getenv("MONGO_URL")
-
-# 🔐 КЛЮЧИ
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME_IN_ENV") 
 GAME_SERVER_SECRET = os.getenv("GAME_SERVER_SECRET", "MY_SUPER_SECRET_GAME_KEY_123") 
 
@@ -36,7 +33,6 @@ app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- ⚙️ НАСТРОЙКИ ---
 TIER_CONFIG = {
     1: {"cost": 8, "time": 60,  "payout": 6},
     2: {"cost": 15, "time": 180, "payout": 11},
@@ -44,11 +40,10 @@ TIER_CONFIG = {
 }
 
 DAILY_LIMIT = 20
-STARTING_TEST_BALANCE = 500  # Подарок
-AUTO_APPROVE_VISITS = 500    # 🛡 Порог доверия (если меньше - на проверку)
+STARTING_TEST_BALANCE = 500
+AUTO_APPROVE_VISITS = 500
 
-# --- 🛡 ФУНКЦИИ ЗАЩИТЫ ---
-
+# --- ЗАЩИТА ---
 async def verify_roblox_request(request: Request):
     user_agent = request.headers.get("user-agent", "")
     is_roblox = "Roblox/" in user_agent
@@ -60,7 +55,6 @@ async def verify_game_secret(x_game_secret: str = Header(None)):
     if x_game_secret != GAME_SERVER_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
 
-# 🕵️‍♂️ ШПИОН: ПРОВЕРКА ВИЗИТОВ
 async def get_roblox_visits(place_id: int):
     try:
         async with httpx.AsyncClient() as client:
@@ -93,7 +87,7 @@ class RewardClaim(BaseModel):
     player_id: int; current_place_id: int
 class AddBalance(BaseModel):
     owner_id: int; amount: int
-class AdminDecision(BaseModel): # 👈 Для Postman
+class AdminDecision(BaseModel):
     placeId: int; action: str 
 
 # --- ЭНДПОИНТЫ ---
@@ -118,7 +112,6 @@ def get_dashboard(request: Request, ownerId: int, placeId: int):
 @app.get("/get-quests")
 @limiter.limit("120/minute")
 def get_quests(request: Request):
-    # Фильтр: Только ACTIVE игры
     all_active_games = list(db["games"].find({"status": "active", "remaining_visits": {"$gt": 0}}, {"_id": 0}))
     available_quests = []
     today_start = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -127,7 +120,6 @@ def get_quests(request: Request):
         if completed < DAILY_LIMIT: available_quests.append(game)
     return {"success": True, "quests": available_quests}
 
-# 🔥 РЕГИСТРАЦИЯ (ФЕЙС-КОНТРОЛЕМ)
 @app.post("/register-game", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 @limiter.limit("10/minute")
 async def register_game(request: Request, data: GameRegistration):
@@ -135,20 +127,18 @@ async def register_game(request: Request, data: GameRegistration):
     games = db["games"]
     tier_data = TIER_CONFIG.get(data.tier, TIER_CONFIG[1])
     
-    # 1. Подарок 500 (Один раз)
     user = users.find_one({"_id": data.ownerId})
     if not user:
         users.insert_one({"_id": data.ownerId, "balance": 0, "test_balance": STARTING_TEST_BALANCE})
     elif "test_balance" not in user:
         users.update_one({"_id": data.ownerId}, {"$set": {"test_balance": STARTING_TEST_BALANCE}})
 
-    # 2. Статус (Pending или Active)
     existing_game = games.find_one({"placeId": data.placeId})
     current_status = existing_game.get("status", "inactive") if existing_game else "inactive"
     
     if current_status == "active":
         new_status = "active"
-        msg = "(Already Active)"
+        msg = "(Updated)"
     else:
         real_visits = await get_roblox_visits(data.placeId)
         if real_visits >= AUTO_APPROVE_VISITS:
@@ -156,7 +146,7 @@ async def register_game(request: Request, data: GameRegistration):
             msg = "(Auto-Approved)"
         else:
             new_status = "pending"
-            msg = "(Sent to Admin Review)"
+            msg = "(Sent Review)"
 
     games.update_one(
         {"placeId": data.placeId},
@@ -165,7 +155,6 @@ async def register_game(request: Request, data: GameRegistration):
             "tier": data.tier, "visit_cost": tier_data["cost"], "time_required": tier_data["time"],
             "payout_amount": tier_data["payout"], "quest_type": data.quest_type,
             "status": new_status, 
-            "last_visits_check": real_visits if 'real_visits' in locals() else 0,
             "last_updated": datetime.datetime.utcnow()
         },
         "$setOnInsert": {"remaining_visits": 0}}, 
@@ -173,7 +162,6 @@ async def register_game(request: Request, data: GameRegistration):
     )
     return {"success": True, "message": f"Registered {msg}", "status": new_status}
 
-# 🔥 ПОКУПКА (СМЕШАННАЯ ОПЛАТА + ПРОВЕРКА СТАТУСА)
 @app.post("/buy-visits", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 @limiter.limit("20/minute")
 def buy_visits(request: Request, data: BuyVisits):
@@ -183,9 +171,8 @@ def buy_visits(request: Request, data: BuyVisits):
     game = games.find_one({"placeId": data.placeId})
     if not game: return {"success": False, "message": "Game not registered"}
     
-    # ⛔ БЛОК, ЕСЛИ ИГРА НЕ ACTIVE
     if game.get("status") != "active":
-        return {"success": False, "message": "⛔ Game is under Review. Wait for approval."}
+        return {"success": False, "message": "⛔ Game is under Review."}
     
     total_cost = data.amount * game.get("visit_cost", 10)
     user = users.find_one({"_id": data.ownerId})
@@ -194,12 +181,11 @@ def buy_visits(request: Request, data: BuyVisits):
     real_bal = user.get("balance", 0)
     test_bal = user.get("test_balance", 0)
     
-    # СМЕШАННАЯ ОПЛАТА
     to_pay_test = min(test_bal, total_cost)
     to_pay_real = total_cost - to_pay_test
     
     if real_bal < to_pay_real:
-        return {"success": False, "message": f"Need {total_cost}. You have {test_bal} Test + {real_bal} Real."}
+        return {"success": False, "message": f"Need {total_cost}. Have {test_bal} Test + {real_bal} Real."}
     
     if to_pay_test > 0: users.update_one({"_id": data.ownerId}, {"$inc": {"test_balance": -to_pay_test}})
     if to_pay_real > 0: users.update_one({"_id": data.ownerId}, {"$inc": {"balance": -to_pay_real}})
@@ -207,15 +193,11 @@ def buy_visits(request: Request, data: BuyVisits):
     games.update_one({"placeId": data.placeId}, {"$inc": {"remaining_visits": data.amount}})
     return {"success": True, "message": f"Paid (Test:{to_pay_test}, Real:{to_pay_real})"}
 
-# --- 👮‍♂️ АДМИНКА ДЛЯ POSTMAN ---
-
-# 1. Посмотреть очередь на проверку
 @app.get("/admin/pending-games")
 def get_pending_games(x_admin_secret: str = Header(None)):
     if x_admin_secret != ADMIN_SECRET: raise HTTPException(status_code=403)
     return {"games": list(db["games"].find({"status": "pending"}, {"_id": 0}))}
 
-# 2. Принять/Отклонить
 @app.post("/admin/decide-game")
 def admin_decide_game(data: AdminDecision, x_admin_secret: str = Header(None)):
     if x_admin_secret != ADMIN_SECRET: raise HTTPException(status_code=403)
@@ -223,8 +205,6 @@ def admin_decide_game(data: AdminDecision, x_admin_secret: str = Header(None)):
     res = db["games"].update_one({"placeId": data.placeId}, {"$set": {"status": new_status}})
     return {"success": res.modified_count > 0, "status": new_status}
 
-# --- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (Start, Verify, etc) ---
-# ... (Копируй их из предыдущего ответа, они стандартные) ...
 @app.post("/start-quest", dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 @limiter.limit("60/minute")
 def start_quest(request: Request, data: QuestStart):
