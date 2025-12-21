@@ -45,7 +45,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="2.2")
+app = FastAPI(title="Quest Network API", version="2.4")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -88,6 +88,12 @@ class GameRegistration(BaseModel):
     tier: int = 1
     quest_type: str = "time"
     time_required: int = 60
+    reward_text: str = "Reward"
+
+class GameConfigSync(BaseModel):
+    placeId: int
+    currency_name: str
+    rewards: dict 
 
 class BuyVisits(BaseModel):
     ownerId: int
@@ -137,6 +143,21 @@ def get_dashboard(request: Request, ownerId: int, placeId: int):
         "tier": game.get("tier", 1) if game else 1
     }
 
+# === 🔥 НОВЫЙ ЭНДПОИНТ: СИНХРОНИЗАЦИЯ НАГРАД ===
+@app.post("/sync-config", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
+def sync_config(request: Request, data: GameConfigSync):
+    res = games_col.update_one(
+        {"placeId": data.placeId},
+        {"$set": {
+            "currency_name": data.currency_name,
+            "rewards_config": data.rewards,
+            "last_synced": datetime.datetime.utcnow()
+        }}
+    )
+    if res.matched_count == 0:
+        return {"success": False, "message": "Game not registered"}
+    return {"success": True}
+
 @app.post("/register-game", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 async def register_game(request: Request, data: GameRegistration):
     users_col.update_one({"_id": data.ownerId}, {"$setOnInsert": {"balance": 0, "test_balance": STARTING_TEST_BALANCE}}, upsert=True)
@@ -150,6 +171,7 @@ async def register_game(request: Request, data: GameRegistration):
 
     tier_info = TIER_CONFIG.get(data.tier, TIER_CONFIG[1])
     final_time = max(data.time_required, tier_info["time"])
+    final_reward = data.reward_text if data.reward_text else "See Details"
 
     games_col.update_one(
         {"placeId": data.placeId},
@@ -157,7 +179,7 @@ async def register_game(request: Request, data: GameRegistration):
             "ownerId": data.ownerId, "name": data.name, "description": data.description,
             "tier": data.tier, "visit_cost": tier_info["cost"], 
             "time_required": final_time, "payout_amount": tier_info["payout"], 
-            "quest_type": data.quest_type, "status": status, 
+            "quest_type": data.quest_type, "status": status, "reward_text": final_reward,
             "last_updated": datetime.datetime.utcnow()
         },
         "$setOnInsert": {"remaining_visits": 0}}, upsert=True
@@ -185,40 +207,27 @@ def buy_visits(request: Request, data: BuyVisits):
     
     return {"success": True}
 
-# === 🔥 ОБНОВЛЕННЫЙ СПИСОК КВЕСТОВ 🔥 ===
 @app.get("/get-quests", tags=["Quests"])
 def get_quests(request: Request, playerId: int):
-    # 1. Находим квесты, которые игрок УЖЕ выполнил (чтобы скрыть их)
     completed_quests = list(quests_col.find(
         {"player_id": int(playerId), "status": {"$in": ["completed", "claimed"]}},
         {"target_game": 1}
     ))
     completed_ids = [q["target_game"] for q in completed_quests]
 
-    # 2. Находим квесты, которые игрок НАЧАЛ, но не закончил (за 24 часа)
-    # Они должны быть видны, ДАЖЕ если визиты кончились
     yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     active_user_quests = list(quests_col.find(
-        {
-            "player_id": int(playerId), 
-            "status": {"$in": ["started", "arrived"]}, 
-            "timestamp": {"$gte": yesterday}
-        },
+        {"player_id": int(playerId), "status": {"$in": ["started", "arrived"]}, "timestamp": {"$gte": yesterday}},
         {"target_game": 1}
     ))
     active_ids = [q["target_game"] for q in active_user_quests]
 
-    # 3. Собираем список игр
-    # Условие: (Есть визиты ИЛИ Игра в списке Активных у игрока) 
-    #          И (Игры НЕТ в списке Выполненных)
-    #          И (Статус Active)
-    
     query = {
         "status": "active",
-        "placeId": {"$nin": completed_ids}, # Исключаем выполненные
+        "placeId": {"$nin": completed_ids},
         "$or": [
-            {"remaining_visits": {"$gt": 0}}, # Глобально доступные
-            {"placeId": {"$in": active_ids}}  # Лично доступные (резерв)
+            {"remaining_visits": {"$gt": 0}},
+            {"placeId": {"$in": active_ids}}
         ]
     }
     
@@ -228,11 +237,7 @@ def get_quests(request: Request, playerId: int):
 @app.post("/start-quest", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def start_quest(request: Request, data: QuestStart):
     game = games_col.find_one({"placeId": data.destination_place_id})
-    
-    # Разрешаем старт, только если есть визиты (новые игроки)
-    # Если игрок уже начал (повторный клик), мы это проверим в get_quests
-    if not game or game.get("remaining_visits", 0) <= 0: 
-        return {"success": False, "message": "No visits left"}
+    if not game or game.get("remaining_visits", 0) <= 0: return {"success": False, "message": "No visits left"}
     
     token = str(uuid.uuid4())
     quests_col.insert_one({
@@ -247,11 +252,9 @@ def start_quest(request: Request, data: QuestStart):
 def verify_token(request: Request, data: TokenVerification):
     quest = quests_col.find_one({"token": data.token})
     
-    # Проверка на 24 часа
     if quest:
         diff = datetime.datetime.utcnow() - quest["timestamp"]
-        if diff.total_seconds() > 86400: # 24 часа
-            return {"success": False, "message": "Expired"}
+        if diff.total_seconds() > 86400: return {"success": False, "message": "Expired"}
 
     if not quest or quest["status"] != "started": return {"success": False}
     
@@ -284,10 +287,8 @@ async def check_traffic(request: Request, data: TokenVerification):
     
     logger.info(f"Check {data.token[:5]}: {delta:.1f}s (Tier: {tier_time}, Quest: {quest_time})")
 
-    # 1. ЛОГИКА ОПЛАТЫ
+    # 1. ОПЛАТА
     if delta >= tier_time and not quest.get("payout_processed"):
-        # Мы разрешаем списать визит даже в минус, если игрок УЖЕ начал квест.
-        # Это честно, так как он занял слот до того, как они кончились.
         games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
         quests_col.update_one({"_id": quest["_id"]}, {"$set": {"payout_processed": True}})
         
@@ -304,7 +305,7 @@ async def check_traffic(request: Request, data: TokenVerification):
         if owner_pay:
             users_col.update_one({"_id": owner_pay}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
 
-    # 2. ЛОГИКА НАГРАДЫ
+    # 2. НАГРАДА
     if delta >= quest_time:
         if not quest.get("traffic_valid"):
             quests_col.update_one({"_id": quest["_id"]}, {
