@@ -47,7 +47,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="3.1") # Version 3.1 (Error 500 Fix)
+app = FastAPI(title="Quest Network API", version="3.2") # Version 3.2 (Source Game Fix)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -279,9 +279,13 @@ def start_quest(request: Request, data: QuestStart):
     })
     
     if existing_quest:
+        # 🔥 ФИКС 1: Обновляем не только время, но и SOURCE_GAME
         quests_col.update_one(
             {"_id": existing_quest["_id"]},
-            {"$set": {"timestamp": datetime.datetime.utcnow()}}
+            {"$set": {
+                "timestamp": datetime.datetime.utcnow(),
+                "source_game": data.source_place_id # <-- Это важно!
+            }}
         )
         return {"success": True, "token": existing_quest["token"]}
         
@@ -346,7 +350,7 @@ def verify_token(request: Request, data: TokenVerification):
         "tier_time": tier_info["time"]
     }
 
-# === 🔥 ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ CHECK-TRAFFIC (С ЗАЩИТОЙ ОТ 500) 🔥 ===
+# === 🔥 ИСПРАВЛЕННЫЙ CHECK-TRAFFIC (FIX KEY ERROR) 🔥 ===
 @app.post("/check-traffic", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 async def check_traffic(request: Request, data: TokenVerification):
     try:
@@ -372,40 +376,43 @@ async def check_traffic(request: Request, data: TokenVerification):
         delta = (datetime.datetime.utcnow() - arrived).total_seconds()
         tier_time, quest_time = tier_info["time"], game["time_required"]
         
-        # === 💰 БЕЗОПАСНАЯ ЛОГИКА ВЫПЛАТЫ ===
+        # === 💰 ВЫПЛАТА ===
         if delta >= tier_time and not quest.get("payout_processed"):
             try:
                 games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
                 quests_col.update_one({"_id": quest["_id"]}, {"$set": {"payout_processed": True}})
                 
-                src_id = quest["source_game"]
-                src = games_col.find_one({"placeId": src_id})
+                # 🔥 ФИКС 2: БЕЗОПАСНОЕ ПОЛУЧЕНИЕ source_game
+                src_id = quest.get("source_game")
                 
-                owner_pay = None
-                if src:
-                    owner_pay = src.get("ownerId")
-                
-                if not owner_pay:
-                    try:
-                        r_data = await fetch_roblox_game_data(src_id)
-                        if r_data:
-                            owner_pay = r_data["ownerId"]
-                            games_col.update_one(
-                                {"placeId": src_id},
-                                {"$setOnInsert": {"ownerId": owner_pay, "name": r_data["name"], "status": "inactive"}},
-                                upsert=True
-                            )
-                    except Exception as e:
-                        logger.error(f"⚠️ Roblox API Error during payout: {e}")
+                if src_id:
+                    src = games_col.find_one({"placeId": src_id})
+                    owner_pay = None
+                    if src:
+                        owner_pay = src.get("ownerId")
+                    
+                    if not owner_pay:
+                        try:
+                            r_data = await fetch_roblox_game_data(src_id)
+                            if r_data:
+                                owner_pay = r_data["ownerId"]
+                                games_col.update_one(
+                                    {"placeId": src_id},
+                                    {"$setOnInsert": {"ownerId": owner_pay, "name": r_data["name"], "status": "inactive"}},
+                                    upsert=True
+                                )
+                        except Exception as e:
+                            logger.error(f"⚠️ Roblox API Error during payout: {e}")
 
-                if owner_pay: 
-                    users_col.update_one({"_id": int(owner_pay)}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
-                    logger.info(f"💰 Paid {tier_info['payout']} to {owner_pay}")
+                    if owner_pay: 
+                        users_col.update_one({"_id": int(owner_pay)}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
+                        logger.info(f"💰 Paid {tier_info['payout']} to {owner_pay}")
+                    else:
+                        logger.warning(f"⚠️ Could not find owner to pay for source_game: {src_id}")
                 else:
-                    logger.warning(f"⚠️ Could not find owner to pay for source_game: {src_id}")
+                    logger.warning(f"⚠️ Quest {quest['_id']} has NO source_game. Skipping payout.")
 
             except Exception as e:
-                # ЛОГИРУЕМ ошибку, но НЕ ПАДАЕМ (код идет дальше)
                 logger.error(f"❌ CRITICAL PAYOUT ERROR: {e}")
 
         # === 🏁 ЗАВЕРШЕНИЕ КВЕСТА ===
@@ -420,7 +427,6 @@ async def check_traffic(request: Request, data: TokenVerification):
     except Exception as e:
         logger.error(f"❌ UNHANDLED ERROR in check-traffic: {e}")
         return {"success": False, "message": "Server Error", "error": str(e)}
-# ====================================================================
 
 @app.post("/complete-task", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def complete_task(request: Request, data: TokenVerification):
