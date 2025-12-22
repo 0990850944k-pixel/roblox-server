@@ -47,7 +47,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="2.8") # Version 2.8 (Full Race Condition Fix)
+app = FastAPI(title="Quest Network API", version="3.0") # Version 3.0 (Expired Fix)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -109,6 +109,7 @@ class QuestStart(BaseModel):
 
 class TokenVerification(BaseModel):
     token: str
+    current_place_id: int = None # Добавили Optional поле, если вдруг пригодится в будущем
 
 class RewardClaim(BaseModel):
     player_id: int
@@ -207,7 +208,6 @@ def buy_visits(request: Request, data: BuyVisits):
     if pay_t > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"test_balance": -pay_t}})
     if pay_r > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"balance": -pay_r}})
     
-    # 🔥 ОБНОВЛЯЕМ ПАРТИЮ ПРИ ПОКУПКЕ 🔥
     games_col.update_one(
         {"placeId": data.placeId}, 
         {
@@ -267,13 +267,13 @@ def get_quests(request: Request, playerId: int):
 
     return {"success": True, "quests": final_quests}
 
+# === 🔥 ИСПРАВЛЕННЫЙ START-QUEST 🔥 ===
 @app.post("/start-quest", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def start_quest(request: Request, data: QuestStart):
     game = games_col.find_one({"placeId": data.destination_place_id})
     if not game: return {"success": False}
     if game.get("remaining_visits", 0) <= 0: return {"success": False, "message": "No visits left"}
     
-    # ЗАЩИТА ОТ ДУБЛИКАТОВ (Ghost Quests)
     existing_quest = quests_col.find_one({
         "player_id": data.player_id,
         "target_game": data.destination_place_id,
@@ -281,6 +281,11 @@ def start_quest(request: Request, data: QuestStart):
     })
     
     if existing_quest:
+        # 🔥 ФИКС: ОБНОВЛЯЕМ ВРЕМЯ, ЧТОБЫ ТОКЕН НЕ БЫЛ "Expired"
+        quests_col.update_one(
+            {"_id": existing_quest["_id"]},
+            {"$set": {"timestamp": datetime.datetime.utcnow()}}
+        )
         return {"success": True, "token": existing_quest["token"]}
         
     token = str(uuid.uuid4())
@@ -291,8 +296,9 @@ def start_quest(request: Request, data: QuestStart):
         "timestamp": datetime.datetime.utcnow()
     })
     return {"success": True, "token": token}
+# ========================================
 
-# === 🔥 ОБНОВЛЕННАЯ ФУНКЦИЯ ПРОВЕРКИ (С ЗАЩИТОЙ ОТ ГОНКИ) 🔥 ===
+# === 🔥 ИСПРАВЛЕННЫЙ VERIFY-TOKEN (Race Condition Fix) 🔥 ===
 @app.post("/verify-token", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def verify_token(request: Request, data: TokenVerification):
     quest = quests_col.find_one({"token": data.token})
@@ -300,23 +306,33 @@ def verify_token(request: Request, data: TokenVerification):
     if not quest: 
         return {"success": False, "message": "Token not found"}
 
+    # Проверка срока действия (24 часа)
     diff = datetime.datetime.utcnow() - quest["timestamp"]
     if diff.total_seconds() > 86400: 
         return {"success": False, "message": "Expired"}
 
-    # IDEMPOTENCY CHECK: Если статус уже "arrived" (второй скрипт пришел), 
-    # проверяем время прибытия. Если это было только что - разрешаем.
+    game = games_col.find_one({"placeId": quest["target_game"]})
+    if not game:
+        return {"success": False, "message": "Game not found"}
+        
+    tier_info = TIER_CONFIG.get(game.get("tier", 1))
+
+    # IDEMPOTENCY CHECK: Защита от двойного срабатывания скриптов
     if quest["status"] == "arrived":
         arrived_at = quest.get("arrived_at")
+        
+        # Исправляем Timezone (удаляем TZ, если есть, чтобы можно было вычесть из utcnow)
         if isinstance(arrived_at, str): 
-            arrived_at = datetime.datetime.fromisoformat(arrived_at.replace('Z', '+00:00'))
-        if arrived_at.tzinfo: 
+            try:
+                arrived_at = datetime.datetime.fromisoformat(arrived_at.replace('Z', '+00:00'))
+            except:
+                pass # Оставляем как есть, если парсинг не прошел
+        
+        if isinstance(arrived_at, datetime.datetime) and arrived_at.tzinfo:
             arrived_at = arrived_at.replace(tzinfo=None)
             
-        # Если прибыли менее 15 сек назад - это дубль, всё ок
+        # Если прибыли менее 15 сек назад - считаем это дубликатом и разрешаем
         if arrived_at and (datetime.datetime.utcnow() - arrived_at).total_seconds() < 15:
-             game = games_col.find_one({"placeId": quest["target_game"]})
-             tier_info = TIER_CONFIG.get(game.get("tier", 1))
              return {
                  "success": True, 
                  "quest_type": game.get("quest_type", "time"), 
@@ -327,14 +343,11 @@ def verify_token(request: Request, data: TokenVerification):
     if quest["status"] != "started": 
         return {"success": False, "message": "Status is not started"}
     
-    # Если всё ок и статус started — меняем на arrived
+    # Меняем статус на "arrived"
     quests_col.update_one(
         {"_id": quest["_id"]}, 
         {"$set": {"status": "arrived", "arrived_at": datetime.datetime.utcnow()}}
     )
-    
-    game = games_col.find_one({"placeId": quest["target_game"]})
-    tier_info = TIER_CONFIG.get(game.get("tier", 1))
     
     return {
         "success": True, 
@@ -342,7 +355,7 @@ def verify_token(request: Request, data: TokenVerification):
         "time_required": game.get("time_required", 60), 
         "tier_time": tier_info["time"]
     }
-# ================================================================
+# ============================================================
 
 @app.post("/check-traffic", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 async def check_traffic(request: Request, data: TokenVerification):
@@ -350,11 +363,17 @@ async def check_traffic(request: Request, data: TokenVerification):
     if not quest: return {"success": False}
     game = games_col.find_one({"placeId": quest["target_game"]})
     tier_info = TIER_CONFIG.get(game.get("tier", 1))
+    
     arrived = quest.get("arrived_at")
     if isinstance(arrived, str): arrived = datetime.datetime.fromisoformat(arrived.replace('Z', '+00:00'))
-    if arrived.tzinfo: arrived = arrived.replace(tzinfo=None)
+    if arrived and arrived.tzinfo: arrived = arrived.replace(tzinfo=None)
+    
+    if not arrived:
+         return {"success": False, "message": "Not arrived yet"}
+
     delta = (datetime.datetime.utcnow() - arrived).total_seconds()
     tier_time, quest_time = tier_info["time"], game["time_required"]
+    
     if delta >= tier_time and not quest.get("payout_processed"):
         games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
         quests_col.update_one({"_id": quest["_id"]}, {"$set": {"payout_processed": True}})
@@ -367,11 +386,13 @@ async def check_traffic(request: Request, data: TokenVerification):
                 owner_pay = r_data["ownerId"]
                 games_col.insert_one({"placeId": src_id, "ownerId": owner_pay, "name": r_data["name"], "status": "inactive"})
         if owner_pay: users_col.update_one({"_id": owner_pay}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
+        
     if delta >= quest_time:
         if not quest.get("traffic_valid"):
             quests_col.update_one({"_id": quest["_id"]}, {"$set": {"traffic_valid": True, "completed_tier": game.get("tier", 1), "status": "completed"}})
             return {"success": True, "quest_completed": True}
         return {"success": True, "quest_completed": True}
+        
     return {"success": False, "message": "Keep playing"}
 
 @app.post("/complete-task", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
