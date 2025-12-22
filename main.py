@@ -22,9 +22,11 @@ MONGO_URL = os.getenv("MONGO_URL")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME_IN_ENV")
 GAME_SERVER_SECRET = os.getenv("GAME_SERVER_SECRET", "MY_SUPER_SECRET_GAME_KEY_123")
 
+# Лимиты
 DAILY_LIMIT = 20
 STARTING_TEST_BALANCE = 500
-AUTO_APPROVE_VISITS = 500
+# ⚠️ Оставляем 0 для тестов, чтобы игры появлялись сразу
+AUTO_APPROVE_VISITS = 0 
 
 TIER_CONFIG = {
     1: {"cost": 8, "time": 60,  "payout": 6},
@@ -45,7 +47,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="2.4")
+app = FastAPI(title="Quest Network API", version="2.6") # Version 2.6 (Batch Logic)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -143,7 +145,6 @@ def get_dashboard(request: Request, ownerId: int, placeId: int):
         "tier": game.get("tier", 1) if game else 1
     }
 
-# === 🔥 НОВЫЙ ЭНДПОИНТ: СИНХРОНИЗАЦИЯ НАГРАД ===
 @app.post("/sync-config", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def sync_config(request: Request, data: GameConfigSync):
     res = games_col.update_one(
@@ -154,8 +155,7 @@ def sync_config(request: Request, data: GameConfigSync):
             "last_synced": datetime.datetime.utcnow()
         }}
     )
-    if res.matched_count == 0:
-        return {"success": False, "message": "Game not registered"}
+    if res.matched_count == 0: return {"success": False, "message": "Game not registered"}
     return {"success": True}
 
 @app.post("/register-game", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
@@ -180,12 +180,18 @@ async def register_game(request: Request, data: GameRegistration):
             "tier": data.tier, "visit_cost": tier_info["cost"], 
             "time_required": final_time, "payout_amount": tier_info["payout"], 
             "quest_type": data.quest_type, "status": status, "reward_text": final_reward,
-            "last_updated": datetime.datetime.utcnow()
+            "last_updated": datetime.datetime.utcnow(),
+            # Если поле last_refill_at не существует, создаем его (для новых игр)
+            # Если уже есть - не трогаем (setOnInsert)
         },
-        "$setOnInsert": {"remaining_visits": 0}}, upsert=True
+        "$setOnInsert": {
+            "remaining_visits": 0,
+            "last_refill_at": datetime.datetime.utcnow() 
+        }}, upsert=True
     )
     return {"success": True, "status": status}
 
+# === 🔥 ОБНОВЛЕНИЕ ПАРТИИ ПРИ ПОКУПКЕ 🔥 ===
 @app.post("/buy-visits", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def buy_visits(request: Request, data: BuyVisits):
     game = games_col.find_one({"placeId": data.placeId})
@@ -203,42 +209,97 @@ def buy_visits(request: Request, data: BuyVisits):
     
     if pay_t > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"test_balance": -pay_t}})
     if pay_r > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"balance": -pay_r}})
-    games_col.update_one({"placeId": data.placeId}, {"$inc": {"remaining_visits": data.amount}})
+    
+    # ТУТ МАГИЯ: Мы обновляем last_refill_at.
+    # Это сигнал: "Началась новая партия, пустите игроков снова!"
+    games_col.update_one(
+        {"placeId": data.placeId}, 
+        {
+            "$inc": {"remaining_visits": data.amount},
+            "$set": {"last_refill_at": datetime.datetime.utcnow()} 
+        }
+    )
     
     return {"success": True}
 
+
+# === 🔥 ГЛАВНАЯ ЛОГИКА ФИЛЬТРАЦИИ 🔥 ===
 @app.get("/get-quests", tags=["Quests"])
 def get_quests(request: Request, playerId: int):
+    # 1. Получаем список всех квестов, которые игрок КОГДА-ЛИБО выполнил
     completed_quests = list(quests_col.find(
         {"player_id": int(playerId), "status": {"$in": ["completed", "claimed"]}},
-        {"target_game": 1}
+        {"target_game": 1, "timestamp": 1}
     ))
-    completed_ids = [q["target_game"] for q in completed_quests]
+    
+    # Создаем карту: {ID_Игры: Самая_Последняя_Дата_Выполнения}
+    last_completion_map = {}
+    for q in completed_quests:
+        pid = q["target_game"]
+        ts = q["timestamp"]
+        # Если мы уже выполняли квест в этой игре несколько раз, берем последнюю дату
+        if pid not in last_completion_map or ts > last_completion_map[pid]:
+            last_completion_map[pid] = ts
 
+    # 2. Получаем квесты, которые игрок СЕЙЧАС делает (чтобы они не пропадали из списка)
     yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     active_user_quests = list(quests_col.find(
-        {"player_id": int(playerId), "status": {"$in": ["started", "arrived"]}, "timestamp": {"$gte": yesterday}},
+        {
+            "player_id": int(playerId), 
+            "status": {"$in": ["started", "arrived"]}, 
+            "timestamp": {"$gte": yesterday}
+        },
         {"target_game": 1}
     ))
-    active_ids = [q["target_game"] for q in active_user_quests]
+    current_active_ids = [q["target_game"] for q in active_user_quests]
 
-    query = {
-        "status": "active",
-        "placeId": {"$nin": completed_ids},
-        "$or": [
-            {"remaining_visits": {"$gt": 0}},
-            {"placeId": {"$in": active_ids}}
-        ]
-    }
+    # 3. Берем ВСЕ активные игры из базы
+    all_games = list(games_col.find({"status": "active"}, {"_id": 0}))
     
-    games = list(games_col.find(query, {"_id": 0}))
-    return {"success": True, "quests": games}
+    final_quests = []
+    
+    for game in all_games:
+        pid = game["placeId"]
+        
+        # --- ПРОВЕРКА 1: Игрок сейчас делает этот квест? ---
+        if pid in current_active_ids:
+            final_quests.append(game)
+            continue # Показываем!
+            
+        # --- ПРОВЕРКА 2: Кончились визиты? ---
+        if game.get("remaining_visits", 0) <= 0:
+            continue # Скрываем (нет денег у автора)
+            
+        # --- ПРОВЕРКА 3: "Партии" (Твоя логика) ---
+        last_refill_at = game.get("last_refill_at")
+        
+        # Если игрок уже выполнял этот квест...
+        if pid in last_completion_map:
+            last_completed_at = last_completion_map[pid]
+            
+            # Если поле last_refill_at почему-то пустое (старая игра), считаем его очень старым
+            if not last_refill_at:
+                continue # Скрываем (безопасность)
+            
+            # СРАВНЕНИЕ:
+            # Если (Дата Выполнения) > (Дата Покупки Визитов)
+            # Значит, игрок уже "съел" свою попытку из этой партии.
+            if last_completed_at >= last_refill_at:
+                continue # СКРЫВАЕМ (Жди следующей закупки!)
+        
+        # Если прошли все проверки -> Показываем квест
+        final_quests.append(game)
+
+    return {"success": True, "quests": final_quests}
+
+# ... (Остальной код start-quest и далее без изменений, копируй из прошлого файла) ...
+# Я скопирую, чтобы было удобно:
 
 @app.post("/start-quest", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def start_quest(request: Request, data: QuestStart):
     game = games_col.find_one({"placeId": data.destination_place_id})
-    if not game or game.get("remaining_visits", 0) <= 0: return {"success": False, "message": "No visits left"}
-    
+    if not game: return {"success": False}
+    if game.get("remaining_visits", 0) <= 0: return {"success": False, "message": "No visits left"}
     token = str(uuid.uuid4())
     quests_col.insert_one({
         "token": token, "player_id": data.player_id, 
@@ -251,69 +312,43 @@ def start_quest(request: Request, data: QuestStart):
 @app.post("/verify-token", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def verify_token(request: Request, data: TokenVerification):
     quest = quests_col.find_one({"token": data.token})
-    
     if quest:
         diff = datetime.datetime.utcnow() - quest["timestamp"]
         if diff.total_seconds() > 86400: return {"success": False, "message": "Expired"}
-
     if not quest or quest["status"] != "started": return {"success": False}
-    
     quests_col.update_one({"_id": quest["_id"]}, {"$set": {"status": "arrived", "arrived_at": datetime.datetime.utcnow()}})
     game = games_col.find_one({"placeId": quest["target_game"]})
     tier_info = TIER_CONFIG.get(game.get("tier", 1))
-    
-    return {
-        "success": True, 
-        "quest_type": game.get("quest_type", "time"), 
-        "time_required": game.get("time_required", 60),
-        "tier_time": tier_info["time"]
-    }
+    return {"success": True, "quest_type": game.get("quest_type", "time"), "time_required": game.get("time_required", 60), "tier_time": tier_info["time"]}
 
 @app.post("/check-traffic", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 async def check_traffic(request: Request, data: TokenVerification):
     quest = quests_col.find_one({"token": data.token})
     if not quest: return {"success": False}
-    
     game = games_col.find_one({"placeId": quest["target_game"]})
     tier_info = TIER_CONFIG.get(game.get("tier", 1))
-    
     arrived = quest.get("arrived_at")
     if isinstance(arrived, str): arrived = datetime.datetime.fromisoformat(arrived.replace('Z', '+00:00'))
     if arrived.tzinfo: arrived = arrived.replace(tzinfo=None)
-    
     delta = (datetime.datetime.utcnow() - arrived).total_seconds()
-    tier_time = tier_info["time"]
-    quest_time = game["time_required"]
-    
-    logger.info(f"Check {data.token[:5]}: {delta:.1f}s (Tier: {tier_time}, Quest: {quest_time})")
-
-    # 1. ОПЛАТА
+    tier_time, quest_time = tier_info["time"], game["time_required"]
     if delta >= tier_time and not quest.get("payout_processed"):
         games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
         quests_col.update_one({"_id": quest["_id"]}, {"$set": {"payout_processed": True}})
-        
         src_id = quest["source_game"]
         src = games_col.find_one({"placeId": src_id})
         owner_pay = src["ownerId"] if src else None
-        
         if not owner_pay:
             r_data = await fetch_roblox_game_data(src_id)
             if r_data:
                 owner_pay = r_data["ownerId"]
                 games_col.insert_one({"placeId": src_id, "ownerId": owner_pay, "name": r_data["name"], "status": "inactive"})
-        
-        if owner_pay:
-            users_col.update_one({"_id": owner_pay}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
-
-    # 2. НАГРАДА
+        if owner_pay: users_col.update_one({"_id": owner_pay}, {"$inc": {"balance": tier_info["payout"]}}, upsert=True)
     if delta >= quest_time:
         if not quest.get("traffic_valid"):
-            quests_col.update_one({"_id": quest["_id"]}, {
-                "$set": {"traffic_valid": True, "completed_tier": game.get("tier", 1), "status": "completed"}
-            })
+            quests_col.update_one({"_id": quest["_id"]}, {"$set": {"traffic_valid": True, "completed_tier": game.get("tier", 1), "status": "completed"}})
             return {"success": True, "quest_completed": True}
         return {"success": True, "quest_completed": True}
-
     return {"success": False, "message": "Keep playing"}
 
 @app.post("/complete-task", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
@@ -331,7 +366,6 @@ def claim_rewards(request: Request, data: RewardClaim):
     if pending: quests_col.update_many({"_id": {"$in": [q["_id"] for q in pending]}}, {"$set": {"status": "claimed"}})
     return {"success": True, "tiers": [q.get("completed_tier", 1) for q in pending]}
 
-# Admin
 @app.get("/admin/pending-games")
 def p(x_admin_secret: str = Header(None)): return list(games_col.find({"status": "pending"}, {"_id": 0}))
 @app.post("/admin/decide-game")
