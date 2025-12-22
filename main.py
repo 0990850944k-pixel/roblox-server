@@ -47,7 +47,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="2.6") # Version 2.6 (Batch Logic)
+app = FastAPI(title="Quest Network API", version="2.7") # Version 2.7 (Ghost Quest Fix)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -181,8 +181,6 @@ async def register_game(request: Request, data: GameRegistration):
             "time_required": final_time, "payout_amount": tier_info["payout"], 
             "quest_type": data.quest_type, "status": status, "reward_text": final_reward,
             "last_updated": datetime.datetime.utcnow(),
-            # Если поле last_refill_at не существует, создаем его (для новых игр)
-            # Если уже есть - не трогаем (setOnInsert)
         },
         "$setOnInsert": {
             "remaining_visits": 0,
@@ -191,7 +189,6 @@ async def register_game(request: Request, data: GameRegistration):
     )
     return {"success": True, "status": status}
 
-# === 🔥 ОБНОВЛЕНИЕ ПАРТИИ ПРИ ПОКУПКЕ 🔥 ===
 @app.post("/buy-visits", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def buy_visits(request: Request, data: BuyVisits):
     game = games_col.find_one({"placeId": data.placeId})
@@ -210,8 +207,7 @@ def buy_visits(request: Request, data: BuyVisits):
     if pay_t > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"test_balance": -pay_t}})
     if pay_r > 0: users_col.update_one({"_id": data.ownerId}, {"$inc": {"balance": -pay_r}})
     
-    # ТУТ МАГИЯ: Мы обновляем last_refill_at.
-    # Это сигнал: "Началась новая партия, пустите игроков снова!"
+    # 🔥 ОБНОВЛЯЕМ ПАРТИЮ ПРИ ПОКУПКЕ 🔥
     games_col.update_one(
         {"placeId": data.placeId}, 
         {
@@ -222,26 +218,21 @@ def buy_visits(request: Request, data: BuyVisits):
     
     return {"success": True}
 
-
-# === 🔥 ГЛАВНАЯ ЛОГИКА ФИЛЬТРАЦИИ 🔥 ===
 @app.get("/get-quests", tags=["Quests"])
 def get_quests(request: Request, playerId: int):
-    # 1. Получаем список всех квестов, которые игрок КОГДА-ЛИБО выполнил
+    # Логика фильтрации по партиям (Batch Logic)
     completed_quests = list(quests_col.find(
         {"player_id": int(playerId), "status": {"$in": ["completed", "claimed"]}},
         {"target_game": 1, "timestamp": 1}
     ))
     
-    # Создаем карту: {ID_Игры: Самая_Последняя_Дата_Выполнения}
     last_completion_map = {}
     for q in completed_quests:
         pid = q["target_game"]
         ts = q["timestamp"]
-        # Если мы уже выполняли квест в этой игре несколько раз, берем последнюю дату
         if pid not in last_completion_map or ts > last_completion_map[pid]:
             last_completion_map[pid] = ts
 
-    # 2. Получаем квесты, которые игрок СЕЙЧАС делает (чтобы они не пропадали из списка)
     yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     active_user_quests = list(quests_col.find(
         {
@@ -253,53 +244,48 @@ def get_quests(request: Request, playerId: int):
     ))
     current_active_ids = [q["target_game"] for q in active_user_quests]
 
-    # 3. Берем ВСЕ активные игры из базы
     all_games = list(games_col.find({"status": "active"}, {"_id": 0}))
-    
     final_quests = []
     
     for game in all_games:
         pid = game["placeId"]
         
-        # --- ПРОВЕРКА 1: Игрок сейчас делает этот квест? ---
         if pid in current_active_ids:
             final_quests.append(game)
-            continue # Показываем!
+            continue
             
-        # --- ПРОВЕРКА 2: Кончились визиты? ---
         if game.get("remaining_visits", 0) <= 0:
-            continue # Скрываем (нет денег у автора)
+            continue
             
-        # --- ПРОВЕРКА 3: "Партии" (Твоя логика) ---
         last_refill_at = game.get("last_refill_at")
-        
-        # Если игрок уже выполнял этот квест...
         if pid in last_completion_map:
             last_completed_at = last_completion_map[pid]
-            
-            # Если поле last_refill_at почему-то пустое (старая игра), считаем его очень старым
-            if not last_refill_at:
-                continue # Скрываем (безопасность)
-            
-            # СРАВНЕНИЕ:
-            # Если (Дата Выполнения) > (Дата Покупки Визитов)
-            # Значит, игрок уже "съел" свою попытку из этой партии.
-            if last_completed_at >= last_refill_at:
-                continue # СКРЫВАЕМ (Жди следующей закупки!)
+            if not last_refill_at: continue
+            if last_completed_at >= last_refill_at: continue
         
-        # Если прошли все проверки -> Показываем квест
         final_quests.append(game)
 
     return {"success": True, "quests": final_quests}
 
-# ... (Остальной код start-quest и далее без изменений, копируй из прошлого файла) ...
-# Я скопирую, чтобы было удобно:
-
+# === 🔥 ФИКС: ЗАЩИТА ОТ "ПРИЗРАЧНЫХ" КВЕСТОВ 🔥 ===
 @app.post("/start-quest", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def start_quest(request: Request, data: QuestStart):
     game = games_col.find_one({"placeId": data.destination_place_id})
     if not game: return {"success": False}
     if game.get("remaining_visits", 0) <= 0: return {"success": False, "message": "No visits left"}
+    
+    # 1. ПРОВЕРЯЕМ: А не начал ли он этот квест уже?
+    # Если да — не создаем новый, а возвращаем старый токен.
+    existing_quest = quests_col.find_one({
+        "player_id": data.player_id,
+        "target_game": data.destination_place_id,
+        "status": "started"
+    })
+    
+    if existing_quest:
+        return {"success": True, "token": existing_quest["token"]}
+        
+    # 2. Если нет — создаем новый
     token = str(uuid.uuid4())
     quests_col.insert_one({
         "token": token, "player_id": data.player_id, 
@@ -308,6 +294,7 @@ def start_quest(request: Request, data: QuestStart):
         "timestamp": datetime.datetime.utcnow()
     })
     return {"success": True, "token": token}
+# ===================================================
 
 @app.post("/verify-token", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def verify_token(request: Request, data: TokenVerification):
