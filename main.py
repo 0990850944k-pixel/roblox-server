@@ -138,29 +138,31 @@ def get_dashboard(request: Request, ownerId: int, placeId: int):
         users_col.update_one({"_id": int(ownerId)}, {"$set": {"test_balance": STARTING_TEST_BALANCE}})
         user["test_balance"] = STARTING_TEST_BALANCE
 
-    # 2. Ищем ВСЕ игры, принадлежащие этому ownerId
+    # 2. Ищем игры владельца
     user_games_cursor = games_col.find({"ownerId": int(ownerId)})
     
     my_campaigns = []
     for g in user_games_cursor:
-        my_campaigns.append({
-            "gameId": g.get("placeId"),
-            "gameName": g.get("name", "Unknown"),
-            "status": g.get("status", "pending"),
-            "remaining_visits": g.get("remaining_visits", 0),
-            "tier": g.get("tier", 1)
-        })
+        visits = g.get("remaining_visits", 0)
+        
+        # 🔥 ФИЛЬТР: Добавляем только если визитов больше 0
+        if visits > 0:
+            my_campaigns.append({
+                "gameId": g.get("placeId"),
+                "gameName": g.get("name", "Unknown"),
+                "status": g.get("status", "pending"),
+                "remaining_visits": visits,
+                "tier": g.get("tier", 1)
+            })
 
-    # 3. (Опционально) Получаем данные текущей игры для совместимости
+    # 3. Данные текущей игры
     current_game = games_col.find_one({"placeId": int(placeId)})
 
     return {
         "success": True, 
         "balance": user.get("balance", 0), 
         "test_balance": user.get("test_balance", 0),
-        # Возвращаем список игр владельца
         "my_campaigns": my_campaigns,
-        # Данные текущей игры (чтобы не ломать старую логику, если она где-то есть)
         "current_status": current_game.get("status", "not_registered") if current_game else "not_registered"
     }
 
