@@ -128,22 +128,40 @@ class AdminDecision(BaseModel):
 @app.get("/get-dashboard", tags=["Dashboard"])
 @limiter.limit("60/minute") 
 def get_dashboard(request: Request, ownerId: int, placeId: int):
+    # 1. Получаем или создаем пользователя
     user = users_col.find_one({"_id": int(ownerId)})
     if not user:
         users_col.insert_one({"_id": int(ownerId), "balance": 0, "test_balance": STARTING_TEST_BALANCE})
         user = {"balance": 0, "test_balance": STARTING_TEST_BALANCE}
+    
     if "test_balance" not in user:
         users_col.update_one({"_id": int(ownerId)}, {"$set": {"test_balance": STARTING_TEST_BALANCE}})
         user["test_balance"] = STARTING_TEST_BALANCE
 
-    game = games_col.find_one({"placeId": int(placeId)})
+    # 2. Ищем ВСЕ игры, принадлежащие этому ownerId
+    user_games_cursor = games_col.find({"ownerId": int(ownerId)})
+    
+    my_campaigns = []
+    for g in user_games_cursor:
+        my_campaigns.append({
+            "gameId": g.get("placeId"),
+            "gameName": g.get("name", "Unknown"),
+            "status": g.get("status", "pending"),
+            "remaining_visits": g.get("remaining_visits", 0),
+            "tier": g.get("tier", 1)
+        })
+
+    # 3. (Опционально) Получаем данные текущей игры для совместимости
+    current_game = games_col.find_one({"placeId": int(placeId)})
+
     return {
         "success": True, 
         "balance": user.get("balance", 0), 
-        "test_balance": user.get("test_balance", 0), 
-        "remaining_visits": game.get("remaining_visits", 0) if game else 0,
-        "status": game.get("status", "not_registered") if game else "not_registered",
-        "tier": game.get("tier", 1) if game else 1
+        "test_balance": user.get("test_balance", 0),
+        # Возвращаем список игр владельца
+        "my_campaigns": my_campaigns,
+        # Данные текущей игры (чтобы не ломать старую логику, если она где-то есть)
+        "current_status": current_game.get("status", "not_registered") if current_game else "not_registered"
     }
 
 @app.post("/sync-config", tags=["Game Management"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
