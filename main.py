@@ -47,7 +47,7 @@ try:
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="3.2") # Version 3.2 (Source Game Fix)
+app = FastAPI(title="Quest Network API", version="3.3") # Version 3.3 (Ghost Quest Fix)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -218,53 +218,56 @@ def buy_visits(request: Request, data: BuyVisits):
     
     return {"success": True}
 
+# === 🔥 ИСПРАВЛЕННЫЙ GET-QUESTS (УБИРАЕТ ПРИЗРАКОВ) 🔥 ===
 @app.get("/get-quests", tags=["Quests"])
 def get_quests(request: Request, playerId: int):
-    completed_quests = list(quests_col.find(
-        {"player_id": int(playerId), "status": {"$in": ["completed", "claimed"]}},
-        {"target_game": 1, "timestamp": 1}
+    # 1. Получаем ВСЕ записи игрока за последние 24 часа
+    yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+    all_user_quests = list(quests_col.find(
+        {"player_id": int(playerId), "timestamp": {"$gte": yesterday}},
+        {"target_game": 1, "status": 1, "timestamp": 1}
     ))
-    
-    last_completion_map = {}
-    for q in completed_quests:
+
+    # 2. Определяем ПОСЛЕДНИЙ статус для каждой игры
+    game_states = {} 
+
+    for q in all_user_quests:
         pid = q["target_game"]
         ts = q["timestamp"]
-        if pid not in last_completion_map or ts > last_completion_map[pid]:
-            last_completion_map[pid] = ts
+        status = q["status"]
 
-    yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
-    active_user_quests = list(quests_col.find(
-        {
-            "player_id": int(playerId), 
-            "status": {"$in": ["started", "arrived"]}, 
-            "timestamp": {"$gte": yesterday}
-        },
-        {"target_game": 1}
-    ))
-    current_active_ids = [q["target_game"] for q in active_user_quests]
+        # Если этой игры еще нет или запись новее -> обновляем
+        if pid not in game_states or ts > game_states[pid]["timestamp"]:
+            game_states[pid] = {"status": status, "timestamp": ts}
 
+    # 3. Формируем финальный список
     all_games = list(games_col.find({"status": "active"}, {"_id": 0}))
-    final_quests = []
-    
+    final_list = []
+
     for game in all_games:
         pid = game["placeId"]
         
-        if pid in current_active_ids:
-            final_quests.append(game)
-            continue
-            
-        if game.get("remaining_visits", 0) <= 0:
-            continue
-            
-        last_refill_at = game.get("last_refill_at")
-        if pid in last_completion_map:
-            last_completed_at = last_completion_map[pid]
-            if not last_refill_at: continue
-            if last_completed_at >= last_refill_at: continue
-        
-        final_quests.append(game)
+        user_state = game_states.get(pid)
 
-    return {"success": True, "quests": final_quests}
+        if user_state:
+            # Если активный -> показываем
+            if user_state["status"] in ["started", "arrived"]:
+                final_list.append(game)
+                continue
+            
+            # Если выполнен
+            if user_state["status"] in ["completed", "claimed"]:
+                last_refill = game.get("last_refill_at")
+                # Показываем только если игра пополнилась ПОСЛЕ выполнения
+                if last_refill and user_state["timestamp"] < last_refill:
+                    final_list.append(game)
+                continue
+
+        # Если не трогал -> показываем (при наличии визитов)
+        if game.get("remaining_visits", 0) > 0:
+            final_list.append(game)
+
+    return {"success": True, "quests": final_list}
 
 @app.post("/start-quest", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 def start_quest(request: Request, data: QuestStart):
@@ -279,12 +282,11 @@ def start_quest(request: Request, data: QuestStart):
     })
     
     if existing_quest:
-        # 🔥 ФИКС 1: Обновляем не только время, но и SOURCE_GAME
         quests_col.update_one(
             {"_id": existing_quest["_id"]},
             {"$set": {
                 "timestamp": datetime.datetime.utcnow(),
-                "source_game": data.source_place_id # <-- Это важно!
+                "source_game": data.source_place_id 
             }}
         )
         return {"success": True, "token": existing_quest["token"]}
@@ -350,7 +352,6 @@ def verify_token(request: Request, data: TokenVerification):
         "tier_time": tier_info["time"]
     }
 
-# === 🔥 ИСПРАВЛЕННЫЙ CHECK-TRAFFIC (FIX KEY ERROR) 🔥 ===
 @app.post("/check-traffic", tags=["Quests"], dependencies=[Depends(verify_game_secret), Depends(verify_roblox_request)])
 async def check_traffic(request: Request, data: TokenVerification):
     try:
@@ -382,7 +383,6 @@ async def check_traffic(request: Request, data: TokenVerification):
                 games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
                 quests_col.update_one({"_id": quest["_id"]}, {"$set": {"payout_processed": True}})
                 
-                # 🔥 ФИКС 2: БЕЗОПАСНОЕ ПОЛУЧЕНИЕ source_game
                 src_id = quest.get("source_game")
                 
                 if src_id:
