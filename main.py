@@ -138,22 +138,19 @@ def get_dashboard(request: Request, ownerId: int, placeId: int):
         users_col.update_one({"_id": int(ownerId)}, {"$set": {"test_balance": STARTING_TEST_BALANCE}})
         user["test_balance"] = STARTING_TEST_BALANCE
 
-    # 2. Ищем игры владельца
+    # 2. Ищем ВСЕ игры владельца (без фильтрации по визитам)
     user_games_cursor = games_col.find({"ownerId": int(ownerId)})
     
     my_campaigns = []
     for g in user_games_cursor:
-        visits = g.get("remaining_visits", 0)
-        
-        # 🔥 ФИЛЬТР: Добавляем только если визитов больше 0
-        if visits > 0:
-            my_campaigns.append({
-                "gameId": g.get("placeId"),
-                "gameName": g.get("name", "Unknown"),
-                "status": g.get("status", "pending"),
-                "remaining_visits": visits,
-                "tier": g.get("tier", 1)
-            })
+        # 🔥 ИСПРАВЛЕНО: Добавляем ВСЕ игры, чтобы клиент мог показать историю
+        my_campaigns.append({
+            "gameId": g.get("placeId"),
+            "gameName": g.get("name", "Unknown"),
+            "status": g.get("status", "pending"),
+            "remaining_visits": g.get("remaining_visits", 0),
+            "tier": g.get("tier", 1)
+        })
 
     # 3. Данные текущей игры
     current_game = games_col.find_one({"placeId": int(placeId)})
