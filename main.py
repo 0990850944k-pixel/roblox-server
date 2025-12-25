@@ -50,33 +50,33 @@ app = FastAPI(title="Quest Network API", version="4.0 Secure")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# === 🛡️ НОВАЯ СИСТЕМА БЕЗОПАСНОСТИ ===
+# === 🛡️ ИСПРАВЛЕННАЯ СИСТЕМА БЕЗОПАСНОСТИ ===
 async def verify_request(
     request: Request, 
     x_api_key: str = Header(None), 
     x_admin_secret: str = Header(None)
 ):
-    # 1. Проверка User-Agent (Roblox)
-    user_agent = request.headers.get("user-agent", "")
-    is_roblox = "Roblox/" in user_agent
-    
-    # Если это не Роблокс и не Админ (ты) - блокируем
-    if not is_roblox and x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Roblox Only")
-
-    # 2. Если это АДМИН (Твой Хаб)
+    # 1. Сначала проверяем АДМИНА (Приоритет №1)
     if x_admin_secret == ADMIN_SECRET:
         return {"role": "admin", "owner_id": None} 
 
-    # 3. Если это КЛИЕНТ (Игра с ключом)
+    # 2. Проверяем ЮЗЕРА (Приоритет №2)
+    # Если прислан валидный ключ, мы доверяем запросу, даже если User-Agent не "Roblox"
     if x_api_key:
         key_doc = keys_col.find_one({"key": x_api_key})
         if key_doc:
-            # Возвращаем ID владельца этого ключа
             return {"role": "user", "owner_id": key_doc["owner_id"]}
     
-    # Если ключа нет или он неверный
-    raise HTTPException(status_code=403, detail="Invalid API Key or Secret")
+    # 3. Если ключей нет или они неверные — тогда проверяем User-Agent
+    # Это нужно, чтобы отсеять случайные запросы из браузера
+    user_agent = request.headers.get("user-agent", "")
+    is_roblox = "Roblox/" in user_agent
+    
+    if not is_roblox:
+        raise HTTPException(status_code=403, detail="Roblox Only")
+
+    # 4. Если это Роблокс, но нет ключа
+    raise HTTPException(status_code=403, detail="Missing or Invalid API Key")
 
 # --- HELPERS ---
 async def fetch_roblox_game_data(place_id: int):
