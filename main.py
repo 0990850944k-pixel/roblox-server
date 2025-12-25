@@ -19,7 +19,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("QuestNetwork")
 
 MONGO_URL = os.getenv("MONGO_URL")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME_IN_ENV")
+
+# 🔥 ИСПРАВЛЕНИЕ: ЖЕСТКО ЗАДАЕМ КЛЮЧ, ЧТОБЫ ОН СОВПАДАЛ С LUA
+ADMIN_SECRET = "MY_SUPER_SECRET_GAME_KEY_123" 
+GAME_SERVER_SECRET = "MY_SUPER_SECRET_GAME_KEY_123" # На всякий случай дублируем
 
 # Лимиты
 DAILY_LIMIT = 20
@@ -41,42 +44,41 @@ try:
     users_col = db["users"]
     games_col = db["games"]
     quests_col = db["quests"]
-    keys_col = db["api_keys"] # 🔥 Новая коллекция для ключей
+    keys_col = db["api_keys"] 
     logger.info("✅ MONGODB CONNECTED")
 except Exception as e:
     logger.error(f"❌ DB ERROR: {e}")
 
-app = FastAPI(title="Quest Network API", version="4.0 Secure")
+app = FastAPI(title="Quest Network API", version="4.1 Fixed")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# === 🛡️ ИСПРАВЛЕННАЯ СИСТЕМА БЕЗОПАСНОСТИ ===
+# === 🛡️ ФИНАЛЬНАЯ СИСТЕМА БЕЗОПАСНОСТИ ===
 async def verify_request(
     request: Request, 
     x_api_key: str = Header(None), 
     x_admin_secret: str = Header(None)
 ):
-    # 1. Сначала проверяем АДМИНА (Приоритет №1)
+    # 1. Проверяем АДМИНА (Приоритет №1)
     if x_admin_secret == ADMIN_SECRET:
         return {"role": "admin", "owner_id": None} 
 
     # 2. Проверяем ЮЗЕРА (Приоритет №2)
-    # Если прислан валидный ключ, мы доверяем запросу, даже если User-Agent не "Roblox"
     if x_api_key:
         key_doc = keys_col.find_one({"key": x_api_key})
         if key_doc:
             return {"role": "user", "owner_id": key_doc["owner_id"]}
     
-    # 3. Если ключей нет или они неверные — тогда проверяем User-Agent
-    # Это нужно, чтобы отсеять случайные запросы из браузера
+    # 3. Если ничего не подошло - логируем попытку взлома и блокируем
     user_agent = request.headers.get("user-agent", "")
-    is_roblox = "Roblox/" in user_agent
     
-    if not is_roblox:
-        raise HTTPException(status_code=403, detail="Roblox Only")
+    # Дебаг в консоль сервера (поможет понять, что приходит)
+    logger.warning(f"⛔ AUTH FAILED. Secret: {x_admin_secret} | Key: {x_api_key} | UA: {user_agent}")
+    
+    if "Roblox/" not in user_agent:
+         raise HTTPException(status_code=403, detail="Roblox Only")
 
-    # 4. Если это Роблокс, но нет ключа
-    raise HTTPException(status_code=403, detail="Missing or Invalid API Key")
+    raise HTTPException(status_code=403, detail="Invalid Credentials")
 
 # --- HELPERS ---
 async def fetch_roblox_game_data(place_id: int):
@@ -102,7 +104,7 @@ class GenerateKeyRequest(BaseModel):
     user_id: int
 
 class GameRegistration(BaseModel):
-    ownerId: int = None # Необязательно (берем из ключа)
+    ownerId: int = None 
     placeId: int
     name: str
     description: str
@@ -144,7 +146,6 @@ class AdminDecision(BaseModel):
 
 # --- ENDPOINTS ---
 
-# 🔑 ГЕНЕРАЦИЯ КЛЮЧА (Только для Админа/Хаба)
 @app.post("/admin/generate-key")
 def generate_key(data: GenerateKeyRequest, auth: dict = Depends(verify_request)):
     if auth["role"] != "admin": raise HTTPException(status_code=403, detail="Admin only")
@@ -153,7 +154,7 @@ def generate_key(data: GenerateKeyRequest, auth: dict = Depends(verify_request))
     if existing:
         return {"success": True, "api_key": existing["key"], "is_new": False}
     
-    new_key = "sk_" + uuid.uuid4().hex[:24] # Пример: sk_a1b2c3d4...
+    new_key = "sk_" + uuid.uuid4().hex[:24] 
     keys_col.insert_one({
         "key": new_key,
         "owner_id": data.user_id,
@@ -164,7 +165,6 @@ def generate_key(data: GenerateKeyRequest, auth: dict = Depends(verify_request))
 @app.get("/get-dashboard", tags=["Dashboard"])
 @limiter.limit("60/minute") 
 def get_dashboard(request: Request, ownerId: int, placeId: int, auth: dict = Depends(verify_request)):
-    # Если запрашивает юзер по ключу, проверяем, что он смотрит СВОЙ дашборд
     if auth["role"] == "user" and auth["owner_id"] != ownerId:
         raise HTTPException(status_code=403, detail="Cannot view other's dashboard")
 
@@ -214,7 +214,6 @@ def sync_config(request: Request, data: GameConfigSync):
 
 @app.post("/register-game", tags=["Game Management"])
 async def register_game(data: GameRegistration, auth: dict = Depends(verify_request)):
-    # 🔥 БЕЗОПАСНОСТЬ: Владелец определяется ключом, а не тем, что прислали
     real_owner_id = auth["owner_id"] if auth["role"] == "user" else data.ownerId
     if not real_owner_id: raise HTTPException(status_code=400, detail="Owner ID unknown")
 
@@ -276,10 +275,8 @@ def buy_visits(request: Request, data: BuyVisits):
     
     return {"success": True}
 
-# === 🔥 GET-QUESTS 🔥 ===
 @app.get("/get-quests", tags=["Quests"])
 def get_quests(request: Request, playerId: int):
-    # (Оставил публичным, так как любой игрок может видеть квесты)
     yesterday = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
     all_user_quests = list(quests_col.find(
         {"player_id": int(playerId), "timestamp": {"$gte": yesterday}},
@@ -398,7 +395,6 @@ async def check_traffic(request: Request, data: TokenVerification):
         delta = (datetime.datetime.utcnow() - arrived).total_seconds()
         tier_time, quest_time = tier_info["time"], game["time_required"]
         
-        # === 💰 ВЫПЛАТА ===
         if delta >= tier_time and not quest.get("payout_processed"):
             try:
                 games_col.update_one({"_id": game["_id"]}, {"$inc": {"remaining_visits": -1}})
@@ -423,7 +419,6 @@ async def check_traffic(request: Request, data: TokenVerification):
             except Exception as e:
                 logger.error(f"❌ CRITICAL PAYOUT ERROR: {e}")
 
-        # === 🏁 ЗАВЕРШЕНИЕ КВЕСТА ===
         if delta >= quest_time:
             if not quest.get("traffic_valid"):
                 quests_col.update_one({"_id": quest["_id"]}, {"$set": {"traffic_valid": True, "completed_tier": tier_val, "status": "completed"}})
